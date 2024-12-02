@@ -112,7 +112,7 @@ class ConditionalResidualBlock1D(nn.Module):
             embed.shape[0], 2, self.out_channels, 1)
         scale = embed[:,0,...]
         bias = embed[:,1,...]
-        out = scale * out + bias
+        out = scale * out + bias    # FiLM modulation
 
         out = self.blocks[1](out)
         out = out + self.residual_conv(x)
