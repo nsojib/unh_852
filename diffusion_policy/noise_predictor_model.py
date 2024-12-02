@@ -5,50 +5,12 @@ import torch.nn.functional as F
 import torchvision
 import math
 
-#@markdown ### **Network**
-#@markdown
-#@markdown Defines a 1D UNet architecture `ConditionalUnet1D`
-#@markdown as the noies prediction network
-#@markdown
-#@markdown Components
-#@markdown - `SinusoidalPosEmb` Positional encoding for the diffusion iteration k
-#@markdown - `Downsample1d` Strided convolution to reduce temporal resolution
-#@markdown - `Upsample1d` Transposed convolution to increase temporal resolution
-#@markdown - `Conv1dBlock` Conv1d --> GroupNorm --> Mish
-#@markdown - `ConditionalResidualBlock1D` Takes two inputs `x` and `cond`. \
-#@markdown `x` is passed through 2 `Conv1dBlock` stacked together with residual connection.
-#@markdown `cond` is applied to `x` with [FiLM](https://arxiv.org/abs/1709.07871) conditioning.
+from film import FiLM   
+from pos_encoding import PositionalEncoding, SinusoidalPosEmb
 
-class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x):
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-
-class Downsample1d(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.conv = nn.Conv1d(dim, dim, 3, 2, 1)
-
-    def forward(self, x):
-        return self.conv(x)
-
-class Upsample1d(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.conv = nn.ConvTranspose1d(dim, dim, 4, 2, 1)
-
-    def forward(self, x):
-        return self.conv(x)
+# Based on https://github.com/real-stanford/diffusion_policy/blob/main/diffusion_policy/model/diffusion/conditional_unet1d.py
+# Modified for simplicity and readability
+# FiLM and PositionalEncoding classes are recreated in another file for clarity
 
 
 class Conv1dBlock(nn.Module):
@@ -67,9 +29,15 @@ class Conv1dBlock(nn.Module):
 
     def forward(self, x):
         return self.block(x)
+    
 
-
-class ConditionalResidualBlock1D(nn.Module):
+    
+class ConditionalResBlock1D(nn.Module):
+    """ 
+    Take both input and conditional feature
+    Use FiLM to modulate the input by the features
+    Use skip connection to add the input to the output
+    """
     def __init__(self,
             in_channels,
             out_channels,
@@ -77,56 +45,91 @@ class ConditionalResidualBlock1D(nn.Module):
             kernel_size=3,
             n_groups=8):
         super().__init__()
+ 
 
-        self.blocks = nn.ModuleList([
-            Conv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups),
-            Conv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups),
-        ])
+        self.block1=Conv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups)
+        self.block2=Conv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups)
 
-        # FiLM modulation https://arxiv.org/abs/1709.07871
-        # predicts per-channel scale and bias
-        cond_channels = out_channels * 2
-        self.out_channels = out_channels
-        self.cond_encoder = nn.Sequential(
-            nn.Mish(),
-            nn.Linear(cond_dim, cond_channels),
-            nn.Unflatten(-1, (-1, 1))
-        )
 
+        self.film = FiLM(out_channels, cond_dim) 
         # make sure dimensions compatible
         self.residual_conv = nn.Conv1d(in_channels, out_channels, 1) \
             if in_channels != out_channels else nn.Identity()
 
     def forward(self, x, cond):
         '''
-            x : [ batch_size x in_channels x horizon ]
-            cond : [ batch_size x cond_dim]
-
-            returns:
-            out : [ batch_size x out_channels x horizon ]
+            x : input
+            cond : conditional features 
         '''
-        out = self.blocks[0](x)
-        embed = self.cond_encoder(cond)
+        out = self.block1(x) 
+        out = self.film(out, cond)            # input modulated by the conditions.
+        out = self.block2(out)
+        out = out + self.residual_conv(x)     #skip connection with correct dim
+        return out 
+    
 
-        embed = embed.reshape(
-            embed.shape[0], 2, self.out_channels, 1)
-        scale = embed[:,0,...]
-        bias = embed[:,1,...]
-        out = scale * out + bias    # FiLM modulation
 
-        out = self.blocks[1](out)
-        out = out + self.residual_conv(x)
-        return out
+class DownModule(nn.Module):
+    """ 
+    contraction path of UNet
+    pass through the conditional resblock, increase the channel size
+    Then downsample to reduce the spatial dimension
+    """
+    def __init__(self, dim_in, dim_out, cond_dim, kernel_size, n_groups, is_last=False):
+        super().__init__()
+        self.crb=ConditionalResBlock1D(
+                    dim_in, dim_out, cond_dim=cond_dim,
+                    kernel_size=kernel_size, n_groups=n_groups) 
+        if is_last:
+            self.downsample = nn.Identity()
+        else: 
+            self.downsample  =  nn.Conv1d(dim_out, dim_out, 3, 2, 1)
+ 
+    def forward(self, x, cond):
+        x = self.crb(x, cond)
+        x_small = self.downsample(x)
 
+        return x, x_small
+    
+class UpModule(nn.Module):
+    """ 
+    expansion path of UNet
+    pass through the conditional resblock, decrease the channel size
+    Then upsample to increase the spatial dimension
+    """
+    def __init__(self, dim_in, dim_out, cond_dim, kernel_size, n_groups, is_last=False):
+        super().__init__()
+        if is_last:
+            self.upsample = nn.Identity()
+        else: 
+            self.upsample = nn.ConvTranspose1d(dim_out, dim_out, 4, 2, 1)
+    
+        self.crb = ConditionalResBlock1D(
+                    dim_in, dim_out, cond_dim=cond_dim,
+                    kernel_size=kernel_size, n_groups=n_groups) 
+
+    def forward(self, x, x_down, cond):
+        x = torch.cat((x, x_down), dim=1)    #unet skip connection
+        x = self.crb(x, cond)
+        x = self.upsample(x)  
+        return x
+    
 
 class ConditionalUnet1D(nn.Module):
+    """ 
+    Unet architecture for 1D input produce 1D output
+    Additional inputs (image features, agent poses) are used as conditional features to guide the prediction
+    Uses positional encoder to embed the timestep for the diffusion step
+    """
+    
     def __init__(self,
         input_dim,
         global_cond_dim,
         diffusion_step_embed_dim=256,
         down_dims=[256,512,1024],
         kernel_size=5,
-        n_groups=8
+        n_groups=8,
+        pos_encoder_model="custom"  #custom: my implementation, default: diffusion policy implementation
         ):
         """
         input_dim: Dim of actions.
@@ -142,10 +145,21 @@ class ConditionalUnet1D(nn.Module):
         super().__init__()
         all_dims = [input_dim] + list(down_dims)
         start_dim = down_dims[0]
-
+        
         dsed = diffusion_step_embed_dim
+        
+        if pos_encoder_model == "custom":
+            pes= PositionalEncoding(dsed, max_len=64)
+            print("Using custom positional encoding")
+        elif pos_encoder_model == "default":
+            pes = SinusoidalPosEmb(dsed)
+            print("Using diffusion positional encoding")
+        else:
+            raise ValueError(f"Unknown pos_encoder_model: {pos_encoder_model}")
+
+        
         diffusion_step_encoder = nn.Sequential(
-            SinusoidalPosEmb(dsed),
+            pes,
             nn.Linear(dsed, dsed * 4),
             nn.Mish(),
             nn.Linear(dsed * 4, dsed),
@@ -155,41 +169,25 @@ class ConditionalUnet1D(nn.Module):
         in_out = list(zip(all_dims[:-1], all_dims[1:]))
         mid_dim = all_dims[-1]
         self.mid_modules = nn.ModuleList([
-            ConditionalResidualBlock1D(
+            ConditionalResBlock1D(
                 mid_dim, mid_dim, cond_dim=cond_dim,
                 kernel_size=kernel_size, n_groups=n_groups
-            ),
-            ConditionalResidualBlock1D(
-                mid_dim, mid_dim, cond_dim=cond_dim,
-                kernel_size=kernel_size, n_groups=n_groups
-            ),
+            ), 
         ])
 
-        down_modules = nn.ModuleList([])
+        down_modules = nn.ModuleList([])  
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (len(in_out) - 1)
-            down_modules.append(nn.ModuleList([
-                ConditionalResidualBlock1D(
-                    dim_in, dim_out, cond_dim=cond_dim,
-                    kernel_size=kernel_size, n_groups=n_groups),
-                ConditionalResidualBlock1D(
-                    dim_out, dim_out, cond_dim=cond_dim,
-                    kernel_size=kernel_size, n_groups=n_groups),
-                Downsample1d(dim_out) if not is_last else nn.Identity()
-            ]))
+            down_modules.append(
+                DownModule(dim_in, dim_out, cond_dim, kernel_size, n_groups, is_last)
+            )  
 
         up_modules = nn.ModuleList([])
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
             is_last = ind >= (len(in_out) - 1)
-            up_modules.append(nn.ModuleList([
-                ConditionalResidualBlock1D(
-                    dim_out*2, dim_in, cond_dim=cond_dim,
-                    kernel_size=kernel_size, n_groups=n_groups),
-                ConditionalResidualBlock1D(
-                    dim_in, dim_in, cond_dim=cond_dim,
-                    kernel_size=kernel_size, n_groups=n_groups),
-                Upsample1d(dim_in) if not is_last else nn.Identity()
-            ]))
+            up_modules.append(
+                UpModule(dim_out*2, dim_in, cond_dim, kernel_size, n_groups, is_last)
+            )  
 
         final_conv = nn.Sequential(
             Conv1dBlock(start_dim, start_dim, kernel_size=kernel_size),
@@ -199,12 +197,9 @@ class ConditionalUnet1D(nn.Module):
         self.diffusion_step_encoder = diffusion_step_encoder
         self.up_modules = up_modules
         self.down_modules = down_modules
-        self.final_conv = final_conv
+        self.final_conv = final_conv 
 
-        print("ConditionalUnet1D: number of parameters: {:e}".format(
-            sum(p.numel() for p in self.parameters()))
-        )
-
+ 
     def forward(self,
             sample: torch.Tensor,
             timestep: Union[torch.Tensor, float, int],
@@ -216,42 +211,27 @@ class ConditionalUnet1D(nn.Module):
         output: (B,T,input_dim)
         """
         # (B,T,C)
-        sample = sample.moveaxis(-1,-2)
-        # (B,C,T)
+        sample = sample.moveaxis(-1,-2)  # (B,C,T)
 
-        # 1. time
-        timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
-        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
+        # 1. time 
+        timestep  = timestep.expand(sample.shape[0]) 
+        positional_feature = self.diffusion_step_encoder(timestep)
 
-        global_feature = self.diffusion_step_encoder(timesteps)
+        global_feature = torch.cat([positional_feature, global_cond], axis=-1)
 
-        if global_cond is not None:
-            global_feature = torch.cat([
-                global_feature, global_cond
-            ], axis=-1)
-
+        # unet training
         x = sample
         h = []
-        for idx, (resnet, resnet2, downsample) in enumerate(self.down_modules):
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
+        for down_module in self.down_modules:
+            x, x_small = down_module(x, global_feature) 
             h.append(x)
-            x = downsample(x)
+            x = x_small 
 
         for mid_module in self.mid_modules:
             x = mid_module(x, global_feature)
 
-        for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
-            x = torch.cat((x, h.pop()), dim=1)
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
-            x = upsample(x)
+        for upmodule  in self.up_modules:
+            x= upmodule(x, h.pop(), global_feature) 
 
         x = self.final_conv(x)
 
