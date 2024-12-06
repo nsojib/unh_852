@@ -17,15 +17,16 @@ from myddpm import MyScheduler, MyDDPM
 from rollout import rollout
 import argparse 
 
-import sys 
+import sys  
 # sys.path.append('/home/carl_lab/diffusion_policy/')  
-sys.path.append('/home/ns1254/diffusion_policy/')
-
+sys.path.append('/home/ns1254/diffusion_policy/') 
 
 from diffusion_policy.env.pusht.pusht_image_env import PushTImageEnv
  
  
 def main(args): 
+    
+    # hyperparameters
     pred_horizon = 16
     obs_horizon = 2
     action_horizon = 8
@@ -42,9 +43,9 @@ def main(args):
     num_epochs = args.epochs
     seed=args.seed
     eval_epochs=args.eval_epochs
-    pos_encoder = args.pos_encoder
+    pos_encoder=args.pos_encoder
     
-    
+    # loading the dataset
     dataset = PushTImageDatasetFromHDF5(
         hdf5_file_name=hdf5_file_name,
         pred_horizon=pred_horizon,
@@ -80,7 +81,7 @@ def main(args):
     _ = nets.to(device)
 
 
-    # diffusion model
+    # diffusion model (scheduler and sampler)
     num_diffusion_iters = 100
     sample_shape=(pred_horizon, action_dim) 
 
@@ -164,6 +165,9 @@ def main(args):
     print('Mean Reward: ', np.mean(rewards))
     print('Mean Length: ', np.mean(lengths))
 
+    mean_r= np.mean(rewards)
+    #save the model
+    torch.save(nets, f'trained_model_{mean_r}.pth')
  
 
 if __name__ == '__main__':
