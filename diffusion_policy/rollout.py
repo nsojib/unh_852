@@ -50,8 +50,7 @@ def rollout(env, nets, ddpm, obs_horizon, action_horizon, stats, sample_shape, d
             # only take action_horizon number of actions
             start = obs_horizon - 1
             end = start + action_horizon
-            action = action_pred[start:end,:]
-            # (action_horizon, action_dim)
+            action = action_pred[start:end,:] # (action_horizon, action_dim)
 
             # receding horizon control: execute n action before re-planning
             for i in range(len(action)):

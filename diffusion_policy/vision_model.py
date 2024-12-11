@@ -4,11 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
-#@markdown ### **Vision Encoder**
-#@markdown
-#@markdown Defines helper functions:
-#@markdown - `get_resnet` to initialize standard ResNet vision encoder
-#@markdown - `replace_bn_with_gn` to replace all BatchNorm layers with GroupNorm
+# *  get_resnet, replace_submodules, replace_bn_with_gn utility functions are copied from original paper codebase
 
 def get_resnet(name:str, weights=None, **kwargs) -> nn.Module:
     """

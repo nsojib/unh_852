@@ -74,6 +74,13 @@ def main(args):
         global_cond_dim=obs_dim*obs_horizon,
         pos_encoder_model=pos_encoder
     )
+
+    #print number of parameters for each network
+    print('Number of parameters for vision encoder:', sum(p.numel() for p in vision_encoder.parameters()))
+    print('Number of parameters for noise predictor:', sum(p.numel() for p in noise_pred_net.parameters()))
+
+
+
     nets = nn.ModuleDict({
         'vision_encoder': vision_encoder,
         'noise_pred_net': noise_pred_net
@@ -187,3 +194,5 @@ if __name__ == '__main__':
 
 
 
+# Number of parameters for vision encoder: 749120
+# Number of parameters for noise predictor: 43189762
